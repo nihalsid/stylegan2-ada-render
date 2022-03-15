@@ -1,5 +1,4 @@
 import torch.multiprocessing
-torch.multiprocessing.set_sharing_strategy('file_system')    # a fix for the "OSError: too many files" exception
 
 import math
 import shutil
@@ -14,13 +13,15 @@ from torch_ema import ExponentialMovingAverage
 from torchvision.utils import save_image
 from cleanfid import fid
 
-from dataset.image import ImageDataset
+from dataset.render_single_mesh import RenderedSingleMeshDataset
 from model.augment import AugmentPipe
+from model.differentiable_renderer import DifferentiableRenderer
 from model.generator import Generator
 from model.discriminator import Discriminator
 from model.loss import PathLengthPenalty, compute_gradient_penalty
 from trainer import create_trainer
 
+torch.multiprocessing.set_sharing_strategy('file_system')  # a fix for the "OSError: too many files" exception
 
 torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.allow_tf32 = True
@@ -37,8 +38,9 @@ class StyleGAN2Trainer(pl.LightningModule):
         self.D = Discriminator(config.image_size, 3)
         self.augment_pipe = AugmentPipe(config.ada_start_p, config.ada_target, config.ada_interval, config.ada_fixed, config.batch_size)
         self.grid_z = torch.randn(config.num_eval_images, self.config.latent_dim)
-        self.train_set = ImageDataset(config.dataset_path, config.image_size)
-        self.val_set = ImageDataset(config.dataset_path, config.image_size, config.num_eval_images)
+        self.R = None
+        self.train_set = RenderedSingleMeshDataset("data/render_people_0/000006_tri.obj", "data/render_people_0/tex/rp_philip_animated_006_dif.jpg", 8192)
+        self.val_set = RenderedSingleMeshDataset("data/render_people_0/000006_tri.obj", "data/render_people_0/tex/rp_philip_animated_006_dif.jpg", config.num_eval_images)
         self.automatic_optimization = False
         self.path_length_penalty = PathLengthPenalty(0.01, 2)
         self.ema = None
@@ -67,7 +69,7 @@ class StyleGAN2Trainer(pl.LightningModule):
             gen_loss = torch.nn.functional.softplus(-p_fake).mean()
             self.manual_backward(gen_loss)
             log_gen_loss += gen_loss.detach()
-        g_opt.step()
+        step(g_opt, self.G)
         log_gen_loss /= total_acc_steps
         self.log("G", log_gen_loss, on_step=True, on_epoch=False, prog_bar=True, logger=True, sync_dist=True)
 
@@ -81,7 +83,7 @@ class StyleGAN2Trainer(pl.LightningModule):
                     plp_loss = self.config.lambda_plp * plp * self.config.lazy_path_penalty_interval
                     self.manual_backward(plp_loss)
                     log_plp_loss += plp.detach()
-            g_opt.step()
+            step(g_opt, self.G)
             log_plp_loss /= total_acc_steps
             self.log("rPLP", log_plp_loss, on_step=True, on_epoch=False, prog_bar=False, logger=True, sync_dist=True)
 
@@ -105,7 +107,7 @@ class StyleGAN2Trainer(pl.LightningModule):
             self.manual_backward(real_loss)
             log_real_loss += real_loss.detach()
 
-        d_opt.step()
+        step(d_opt, self.D)
         log_real_loss /= total_acc_steps
         log_fake_loss /= total_acc_steps
         self.log("D_real", log_real_loss, on_step=True, on_epoch=False, prog_bar=False, logger=True, sync_dist=True)
@@ -124,7 +126,7 @@ class StyleGAN2Trainer(pl.LightningModule):
                 gp_loss = self.config.lambda_gp * gp * self.config.lazy_gradient_penalty_interval
                 self.manual_backward(gp_loss)
                 log_gp_loss += gp.detach()
-            d_opt.step()
+            step(d_opt, self.D)
             log_gp_loss /= total_acc_steps
             self.log("rGP", log_gp_loss, on_step=True, on_epoch=False, prog_bar=False, logger=True, sync_dist=True)
 
@@ -141,13 +143,16 @@ class StyleGAN2Trainer(pl.LightningModule):
 
     @rank_zero_only
     def validation_epoch_end(self, _val_step_outputs):
-        odir_real, odir_fake, odir_samples = self.create_directories()
-        self.export_images("", odir_samples, None)
+        odir_real, odir_fake, odir_samples, odir_grid = self.create_directories()
+        Path("runs", self.config.experiment, "checkpoints").mkdir(exist_ok=True)
+        torch.save(self.ema, Path("runs") / self.config.experiment / "checkpoints" / f"ema_{self.global_step:09d}.pth")
+        self.export_images("", odir_grid, None, None)
         self.ema.store(self.G.parameters())
         self.ema.copy_to([p for p in self.G.parameters() if p.requires_grad])
-        self.export_images("ema_", odir_samples, odir_fake)
+        self.export_images("ema_", odir_grid, odir_samples, odir_fake)
         self.ema.restore([p for p in self.G.parameters() if p.requires_grad])
         for iter_idx, batch in enumerate(self.val_dataloader()):
+            save_image(batch['image'], odir_samples / f"real_{iter_idx}.jpg", value_range=(-1, 1), normalize=True)
             for batch_idx in range(batch['image'].shape[0]):
                 save_image(batch['image'][batch_idx], odir_real / f"{iter_idx}_{batch_idx}.jpg", value_range=(-1, 1), normalize=True)
         fid_score = fid.compute_fid(odir_real, odir_fake, device=self.device)
@@ -174,12 +179,12 @@ class StyleGAN2Trainer(pl.LightningModule):
         return z1, z2
 
     def train_dataloader(self):
-        return DataLoader(self.train_set, self.config.batch_size, shuffle=True, pin_memory=True, drop_last=True, num_workers=self.config.num_workers)
+        return DataLoader(self.train_set, self.config.batch_size, shuffle=True, pin_memory=False, drop_last=True, num_workers=self.config.num_workers)
 
     def val_dataloader(self):
         return DataLoader(self.val_set, self.config.batch_gpu, shuffle=True, drop_last=True, num_workers=self.config.num_workers)
 
-    def export_images(self, prefix, output_dir_vis, output_dir_fid):
+    def export_images(self, prefix, output_dir_grid, output_dir_samples, output_dir_fid):
         vis_generated_images = []
         for iter_idx, latent in enumerate(self.grid_z.split(self.config.batch_gpu)):
             latent = latent.to(self.device)
@@ -188,31 +193,52 @@ class StyleGAN2Trainer(pl.LightningModule):
                 for batch_idx in range(fake.shape[0]):
                     save_image(fake[batch_idx], output_dir_fid / f"{iter_idx}_{batch_idx}.jpg", value_range=(-1, 1), normalize=True)
             if iter_idx < self.config.num_vis_images // self.config.batch_gpu:
+                if output_dir_samples is not None:
+                    save_image(fake, output_dir_samples / f"fake_{iter_idx}.jpg", value_range=(-1, 1), normalize=True)
                 vis_generated_images.append(fake)
         torch.cuda.empty_cache()
         vis_generated_images = torch.cat(vis_generated_images, dim=0)
-        save_image(vis_generated_images, output_dir_vis / f"{prefix}{self.global_step:06d}.png", nrow=int(math.sqrt(vis_generated_images.shape[0])), value_range=(-1, 1), normalize=True)
+        save_image(vis_generated_images, output_dir_grid / f"{prefix}{self.global_step:06d}.png", nrow=int(math.sqrt(vis_generated_images.shape[0])), value_range=(-1, 1), normalize=True)
 
     def create_directories(self):
         output_dir_fid_real = Path(f'runs/{self.config.experiment}/fid/real')
         output_dir_fid_fake = Path(f'runs/{self.config.experiment}/fid/fake')
+        output_dir_fid_grid = Path(f'runs/{self.config.experiment}/grid/')
         output_dir_fid_samples = Path(f'runs/{self.config.experiment}/images/')
-        for odir in [output_dir_fid_real, output_dir_fid_fake, output_dir_fid_samples]:
+        for odir in [output_dir_fid_real, output_dir_fid_fake, output_dir_fid_grid, output_dir_fid_samples]:
             odir.mkdir(exist_ok=True, parents=True)
-        return output_dir_fid_real, output_dir_fid_fake, output_dir_fid_samples
+        return output_dir_fid_real, output_dir_fid_fake, output_dir_fid_samples, output_dir_fid_grid
 
     def on_train_start(self):
-        if self.ema is None:
-            self.ema = ExponentialMovingAverage(self.G.parameters(), 0.995)
+        self.run_post_device_setup()
 
     def on_validation_start(self):
+        self.run_post_device_setup()
+
+    def run_post_device_setup(self):
         if self.ema is None:
             self.ema = ExponentialMovingAverage(self.G.parameters(), 0.995)
+        if self.R is None:
+            self.R = DifferentiableRenderer(self.config.image_size, "bounds")
+            self.train_set.set_renderer(self.R)
+            self.train_set.set_device(self.device)
+            self.val_set.set_renderer(self.R)
+            self.val_set.set_device(self.device)
+        if self.config.resume_ema is not None:
+            self.ema = torch.load(self.config.resume_ema, map_location=self.device)
+
+
+def step(opt, module):
+    for param in module.parameters():
+        if param.grad is not None:
+            torch.nan_to_num(param.grad, nan=0, posinf=1e5, neginf=-1e5, out=param.grad)
+    torch.nn.utils.clip_grad_norm_(module.parameters(), 1)
+    opt.step()
 
 
 @hydra.main(config_path='../config', config_name='stylegan2')
 def main(config):
-    trainer = create_trainer("StyleGAN2", config)
+    trainer = create_trainer("RenderGAN", config)
     model = StyleGAN2Trainer(config)
     trainer.fit(model)
 

@@ -26,7 +26,6 @@ def generate_experiment_name(name, config):
 
 
 def create_trainer(name, config):
-    ds_name = Path(config.dataset_path).name
     if not config.wandb_main and config.suffix == '':
         config.suffix = '-dev'
     config.experiment = generate_experiment_name(name, config)
