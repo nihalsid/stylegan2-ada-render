@@ -15,7 +15,11 @@ def transform_pos(pos, projection_matrix, world_to_cam_matrix):
 def transform_pos_mvp(pos, mvp):
     # noinspection PyArgumentList
     posw = torch.cat([pos, torch.ones([pos.shape[0], 1]).to(pos.device)], axis=1)
-    return torch.bmm(posw.unsqueeze(0).expand(mvp.shape[0], -1, -1), mvp.permute((0, 2, 1))).reshape((-1, 4))
+    posh = torch.bmm(posw.unsqueeze(0).expand(mvp.shape[0], -1, -1), mvp.permute((0, 2, 1))).reshape((-1, 4))
+    pos = torch.zeros_like(posh)
+    pos[:, :3] = posh[:, :3] / posh[:, 3:4]
+    pos[:, 3] = 1
+    return pos
 
 
 def render(glctx, pos_clip, pos_idx, vtx_col, col_idx, resolution, ranges, _colorspace, background=None):
@@ -28,7 +32,8 @@ def render(glctx, pos_clip, pos_idx, vtx_col, col_idx, resolution, ranges, _colo
     else:
         one_tensor = background
     one_tensor_permuted = one_tensor.permute((0, 2, 3, 1)).contiguous()
-    color = torch.where(mask, one_tensor_permuted, color)
+    color = torch.where(mask, one_tensor_permuted, color)  # [:, :, :, :-1]
+    color[..., -1:] = mask.float()
     return color[:, :, :, :-1]
 
 

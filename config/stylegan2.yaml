@@ -9,7 +9,7 @@ val_check_interval: 1
 resume: null
 resume_ema: null
 
-num_mapping_layers: 2
+num_mapping_layers: 5
 lr_g: 0.002
 lr_d: 0.00235
 lazy_gradient_penalty_interval: 16
@@ -18,6 +18,10 @@ lazy_path_penalty_interval: 4
 latent_dim: 512
 lambda_gp: 0.0256
 lambda_plp: 2
+lambda_offset: 5000
+lambda_smoothness: 2000
+lambda_offsetlaplace: 1000
+warm_up_steps: 500
 ada_start_p: 0.  #to disable set to -1
 ada_target: 0.6
 ada_interval: 4
@@ -25,10 +29,11 @@ ada_fixed: False
 generator: stylegan2
 
 image_size: 128
-num_eval_images: 4096
-num_vis_images: 1024
+texture_size: 128
+mipmap: True
+num_eval_images: 512
+num_vis_images: 256
 batch_size: 8
-batch_gpu: null
 num_workers: 0
 
 wandb_main: False

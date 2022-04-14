@@ -1,5 +1,8 @@
 import torch
 from ballpark import business
+import torch_scatter
+from pathlib import Path
+import numpy as np
 
 
 def print_model_parameter_count(model):
@@ -95,3 +98,32 @@ class EasyDict(dict):
 
     def __delattr__(self, name):
         del self[name]
+
+
+def vertex_to_normals(vertices, faces):
+    triangles = vertices[faces, :3]
+    vector_0 = triangles[:, 1, :] - triangles[:, 0, :]
+    vector_1 = triangles[:, 2, :] - triangles[:, 1, :]
+    cross = torch.cross(vector_0, vector_1, dim=1)
+    face_normals = torch.nn.functional.normalize(cross, p=2.0, dim=1)
+    vertex_normals = torch.zeros((vertices.shape[0], 3), device=vertices.device)
+    torch_scatter.scatter_mean(face_normals.unsqueeze(1).expand(-1, 3, -1).reshape(-1, 3), faces.reshape(-1), dim=0, out=vertex_normals)
+    vertex_normals = torch.nn.functional.normalize(vertex_normals, p=2.0, dim=1)
+    vertex_normals = torch.cat([vertex_normals, torch.ones([vertex_normals.shape[0], 1], device=vertex_normals.device)], dim=1)
+    return vertex_normals
+
+
+def load_laplacian(filename, lambda_key):
+    if Path(filename).exists():
+        inverse_laplacian = np.load(filename)[lambda_key]
+        return inverse_laplacian
+    else:
+        return None
+
+
+def load_inverse_laplacian(filename, lambda_key):
+    if Path(filename).exists():
+        inverse_laplacian = np.load(filename)[lambda_key]
+        return inverse_laplacian
+    else:
+        return None
